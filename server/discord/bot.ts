@@ -16,6 +16,8 @@ import { getRandomJoke, getFallbackJoke } from './jokes';
 import { calculate, formatCalculationResult } from './calculator';
 import { findUserByUsername, sendDirectMessage, sendDirectMessageToAllMembers } from './dm';
 import { findVoiceChannel, joinVoice, leaveVoice, isInVoice } from './voice';
+import { searchYouTubeTrack, playTrack, stopTrack } from './music';
+import { parseNaturalLanguage, executeAICommands, isAIRequest } from './ai-assistant';
 import { storage } from '../storage';
 
 class DiscordBot {
@@ -105,12 +107,30 @@ class DiscordBot {
         .setName('leavevoice')
         .setDescription('Leave the current voice channel')
         .toJSON();
+        
+      // Add play music command
+      const playCommand = new SlashCommandBuilder()
+        .setName('play')
+        .setDescription('Play a song from Spotify')
+        .addStringOption(option =>
+          option.setName('song')
+            .setDescription('Name of the song to play')
+            .setRequired(true))
+        .toJSON();
+        
+      // Add stop music command
+      const stopCommand = new SlashCommandBuilder()
+        .setName('stop')
+        .setDescription('Stop the currently playing music')
+        .toJSON();
       
       slashCommands.push(jokeCommand);
       slashCommands.push(calculateCommand);
       slashCommands.push(dmCommand);
       slashCommands.push(joinVoiceCommand);
       slashCommands.push(leaveVoiceCommand);
+      slashCommands.push(playCommand);
+      slashCommands.push(stopCommand);
       
       console.log('Registering slash commands...');
       
@@ -144,6 +164,30 @@ class DiscordBot {
       // Ignore bot messages
       if (message.author.bot) {
         console.log('Ignoring message from bot');
+        return;
+      }
+
+      // Check if this is an AI request (bot mention with natural language)
+      if (isAIRequest(message, this.client.user?.id || '')) {
+        console.log('Processing AI request:', message.content);
+        
+        try {
+          // Remove the bot mention from the message
+          const cleanMessage = message.content
+            .replace(/<@!?\d+>/g, '')
+            .trim();
+          
+          // Parse the natural language request
+          const commands = parseNaturalLanguage(cleanMessage);
+          
+          // Execute the parsed commands
+          await executeAICommands(this.client, message, commands);
+          
+        } catch (error) {
+          console.error('Error processing AI request:', error);
+          await message.reply('Sorry, I encountered an error while processing your request.');
+        }
+        
         return;
       }
 
@@ -341,6 +385,114 @@ class DiscordBot {
             });
           } catch (error) {
             console.error('Error leaving voice channel:', error);
+            await message.reply(`An error occurred: ${error}`);
+            
+            // Log the error
+            await storage.createCommandLog({
+              userId: message.author.id,
+              username: message.author.username,
+              command: content,
+              serverId: message.guild?.id,
+              serverName: message.guild?.name,
+              status: 'Error'
+            });
+          }
+          
+          return;
+        }
+        
+        // Check for play command
+        if (content.startsWith('/play ')) {
+          console.log('Processing play command from text message');
+          
+          if (!message.guild) {
+            await message.reply('This command can only be used in a server.');
+            return;
+          }
+          
+          const songQuery = content.slice(6).trim(); // Remove "/play "
+          if (!songQuery) {
+            await message.reply('Please provide a song name. Example: `/play bohemian rhapsody`');
+            return;
+          }
+          
+          const processingMsg = await message.reply('🔍 Searching for the song...');
+          
+          try {
+            // Search for the track on YouTube
+            const track = await searchYouTubeTrack(songQuery);
+            
+            if (!track) {
+              await processingMsg.edit('❌ Could not find that song on YouTube. Try a different search term.');
+              return;
+            }
+            
+            // Play the track
+            const result = await playTrack(message.guild.id, track);
+            
+            if (result.success) {
+              await processingMsg.edit(result.message);
+            } else {
+              await processingMsg.edit(`❌ ${result.message}`);
+            }
+            
+            // Log the command
+            await storage.createCommandLog({
+              userId: message.author.id,
+              username: message.author.username,
+              command: content,
+              serverId: message.guild.id,
+              serverName: message.guild.name,
+              status: result.success ? 'Success' : 'Error'
+            });
+          } catch (error) {
+            console.error('Error playing music:', error);
+            await processingMsg.edit(`An error occurred: ${error}`);
+            
+            // Log the error
+            await storage.createCommandLog({
+              userId: message.author.id,
+              username: message.author.username,
+              command: content,
+              serverId: message.guild?.id,
+              serverName: message.guild?.name,
+              status: 'Error'
+            });
+          }
+          
+          return;
+        }
+        
+        // Check for stop command
+        if (content === '/stop') {
+          console.log('Processing stop command from text message');
+          
+          if (!message.guild) {
+            await message.reply('This command can only be used in a server.');
+            return;
+          }
+          
+          try {
+            // Stop the music
+            const result = stopTrack(message.guild.id);
+            
+            if (result.success) {
+              await message.reply(result.message);
+            } else {
+              await message.reply(`❌ ${result.message}`);
+            }
+            
+            // Log the command
+            await storage.createCommandLog({
+              userId: message.author.id,
+              username: message.author.username,
+              command: content,
+              serverId: message.guild.id,
+              serverName: message.guild.name,
+              status: result.success ? 'Success' : 'Error'
+            });
+          } catch (error) {
+            console.error('Error stopping music:', error);
             await message.reply(`An error occurred: ${error}`);
             
             // Log the error
@@ -722,6 +874,127 @@ class DiscordBot {
               userId: interaction.user.id,
               username: interaction.user.username,
               command: `/leavevoice`,
+              serverId: interaction.guildId,
+              serverName: interaction.guild?.name,
+              status: 'Error'
+            });
+          }
+          
+          return;
+        }
+        
+        // Special handling for play command
+        if (interaction.commandName === 'play') {
+          console.log('Processing play command');
+          
+          // Check if we're in a guild
+          if (!interaction.guild) {
+            await interaction.reply({
+              content: 'This command can only be used in a server.',
+              ephemeral: true
+            });
+            return;
+          }
+          
+          // Get the song parameter
+          const songQuery = interaction.options.getString('song');
+          if (!songQuery) {
+            await interaction.reply({
+              content: 'Please provide a song name.',
+              ephemeral: true
+            });
+            return;
+          }
+          
+          await interaction.deferReply();
+          
+          try {
+            // Search for the track on YouTube
+            await interaction.editReply('🔍 Searching for the song...');
+            const track = await searchYouTubeTrack(songQuery);
+            
+            if (!track) {
+              await interaction.editReply('❌ Could not find that song on YouTube. Try a different search term.');
+              return;
+            }
+            
+            // Play the track
+            const result = await playTrack(interaction.guild.id, track);
+            
+            if (result.success) {
+              await interaction.editReply(result.message);
+            } else {
+              await interaction.editReply(`❌ ${result.message}`);
+            }
+            
+            // Log the command
+            await storage.createCommandLog({
+              userId: interaction.user.id,
+              username: interaction.user.username,
+              command: `/play ${songQuery}`,
+              serverId: interaction.guildId,
+              serverName: interaction.guild?.name,
+              status: result.success ? 'Success' : 'Error'
+            });
+          } catch (error) {
+            console.error('Error playing music:', error);
+            await interaction.editReply(`An error occurred: ${error}`);
+            
+            // Log the error
+            await storage.createCommandLog({
+              userId: interaction.user.id,
+              username: interaction.user.username,
+              command: `/play ${songQuery}`,
+              serverId: interaction.guildId,
+              serverName: interaction.guild?.name,
+              status: 'Error'
+            });
+          }
+          
+          return;
+        }
+        
+        // Special handling for stop command
+        if (interaction.commandName === 'stop') {
+          console.log('Processing stop command');
+          
+          // Check if we're in a guild
+          if (!interaction.guild) {
+            await interaction.reply({
+              content: 'This command can only be used in a server.',
+              ephemeral: true
+            });
+            return;
+          }
+          
+          try {
+            // Stop the music
+            const result = stopTrack(interaction.guild.id);
+            
+            if (result.success) {
+              await interaction.reply(result.message);
+            } else {
+              await interaction.reply(`❌ ${result.message}`);
+            }
+            
+            // Log the command
+            await storage.createCommandLog({
+              userId: interaction.user.id,
+              username: interaction.user.username,
+              command: '/stop',
+              serverId: interaction.guildId,
+              serverName: interaction.guild?.name,
+              status: result.success ? 'Success' : 'Error'
+            });
+          } catch (error) {
+            console.error('Error stopping music:', error);
+            await interaction.reply(`An error occurred: ${error}`);
+            
+            // Log the error
+            await storage.createCommandLog({
+              userId: interaction.user.id,
+              username: interaction.user.username,
+              command: '/stop',
               serverId: interaction.guildId,
               serverName: interaction.guild?.name,
               status: 'Error'
@@ -1231,4 +1504,3 @@ export function getDiscordBot(): DiscordBot {
   }
   return botInstance;
 }
-
